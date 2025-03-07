@@ -3,7 +3,6 @@ const mysql = require('mysql2');
 const dgram = require('dgram');
 const http = require('http');
 const WebSocket = require('ws');
-const fetch = require('node-fetch');
 require('dotenv').config();
 
 const app = express();
@@ -33,10 +32,25 @@ udpServer.bind(process.env.UDP_PORT, () => {
     console.log("✅ Servidor Secundario UDP escuchando en puerto", process.env.UDP_PORT);
 });
 
-async function processMessage(datos) {
-    const { latitude, longitude, timestamp } = datos;
+function broadcastData(data) {
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(data));
+        }
+    });
+}
 
-    return new Promise((resolve, reject) => {
+udpServer.on('message', async (msg, rinfo) => {
+    try {
+        const datos = JSON.parse(msg.toString());
+        console.log('\n=== Mensaje UDP Recibido ===');
+        console.log('Puerto: 4665');
+        console.log(`Remitente: ${rinfo.address}:${rinfo.port}`);
+        console.log('Contenido:', msg.toString());
+        console.log('========================\n');
+
+        const { latitude, longitude, timestamp } = datos;
+
         const checkQuery = `
             SELECT id FROM mensaje 
             WHERE TimeStamp = ? 
@@ -48,7 +62,6 @@ async function processMessage(datos) {
         db.query(checkQuery, [timestamp, latitude, longitude], (checkErr, checkResults) => {
             if (checkErr) {
                 console.error("❌ Error al verificar duplicado:", checkErr);
-                reject(checkErr);
                 return;
             }
 
@@ -57,88 +70,29 @@ async function processMessage(datos) {
                 db.query(insertQuery, [latitude, longitude, timestamp], (err, result) => {
                     if (err) {
                         console.error("❌ Error al guardar en MySQL:", err);
-                        reject(err);
                     } else {
-                        console.log("✅ Datos guardados en MySQL");
-                        resolve({
+                        console.log("✅ Datos guardados en MySQL (servidor secundario)");
+                        broadcastData({
                             id: result.insertId,
                             latitude,
                             longitude,
-                            timestamp,
-                            isNew: true
+                            timestamp
                         });
                     }
                 });
             } else {
-                console.log("ℹ️ Dato duplicado, no se insertará");
-                resolve({
+                console.log("ℹ Dato duplicado, no se insertará");
+                broadcastData({
                     id: checkResults[0].id,
                     latitude,
                     longitude,
-                    timestamp,
-                    isNew: false
+                    timestamp
                 });
             }
         });
-    });
-}
-
-udpServer.on('message', async (msg, rinfo) => {
-    try {
-        const datos = JSON.parse(msg.toString());
-        console.log('\n=== Mensaje UDP Recibido ===');
-        console.log(`Puerto: ${process.env.UDP_PORT}`);
-        console.log(`Remitente: ${rinfo.address}:${rinfo.port}`);
-        console.log('Contenido:', msg.toString());
-        console.log('========================\n');
-
-        const result = await processMessage(datos);
-        
-        // Enviar a todos los clientes WebSocket
-        const mensaje = JSON.stringify({
-            id: result.id,
-            latitude: result.latitude,
-            longitude: result.longitude,
-            timestamp: result.timestamp
-        });
-
-        wss.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(mensaje);
-            }
-        });
-
     } catch (error) {
         console.error("❌ Error al procesar mensaje UDP:", error);
     }
-});
-
-wss.on('connection', (ws) => {
-    console.log('✅ Nueva conexión WebSocket establecida');
-    
-    // Enviar último dato al conectar
-    const query = 'SELECT id, Latitud, Longitud, timestamp FROM mensaje ORDER BY id DESC LIMIT 1';
-    db.query(query, (err, results) => {
-        if (err) {
-            console.error('❌ Error al obtener datos:', err);
-        } else if (results.length > 0) {
-            const mensaje = JSON.stringify({
-                id: results[0].id,
-                latitude: results[0].Latitud,
-                longitude: results[0].Longitud,
-                timestamp: results[0].timestamp
-            });
-            ws.send(mensaje);
-        }
-    });
-
-    ws.on('error', (error) => {
-        console.error('❌ Error en WebSocket:', error);
-    });
-
-    ws.on('close', () => {
-        console.log('❌ Conexión WebSocket cerrada');
-    });
 });
 
 app.get('/datos', async (req, res) => {
@@ -153,11 +107,56 @@ app.get('/datos', async (req, res) => {
     });
 });
 
+wss.on('connection', (ws) => {
+    console.log('✅ Nueva conexión WebSocket establecida');
+    
+    const query = 'SELECT id, Latitud, Longitud, timestamp FROM mensaje ORDER BY id DESC LIMIT 1';
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('❌ Error al obtener datos iniciales:', err);
+        } else if (results.length > 0) {
+            const data = {
+                id: results[0].id,
+                latitude: results[0].Latitud,
+                longitude: results[0].Longitud,
+                timestamp: results[0].timestamp
+            };
+            ws.send(JSON.stringify(data));
+        }
+    });
+
+    const updateInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+            const query = 'SELECT id, Latitud, Longitud, timestamp FROM mensaje ORDER BY id DESC LIMIT 1';
+            db.query(query, (err, results) => {
+                if (!err && results.length > 0) {
+                    const data = {
+                        id: results[0].id,
+                        latitude: results[0].Latitud,
+                        longitude: results[0].Longitud,
+                        timestamp: results[0].timestamp
+                    };
+                    ws.send(JSON.stringify(data));
+                }
+            });
+        }
+    }, 1000);
+
+    ws.on('error', (error) => {
+        console.error('❌ Error en WebSocket:', error);
+        clearInterval(updateInterval);
+    });
+
+    ws.on('close', () => {
+        console.log('❌ Conexión WebSocket cerrada');
+        clearInterval(updateInterval);
+    });
+});
+
 server.listen(process.env.PORT, () => {
     console.log("✅ Servidor Secundario en puerto", process.env.PORT);
 });
 
-// Manejo de errores
 process.on('uncaughtException', (error) => {
     console.error('❌ Error no manejado:', error);
 });
